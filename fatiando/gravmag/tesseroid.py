@@ -141,7 +141,8 @@ import numpy
 
 from fatiando.constants import SI2MGAL, SI2EOTVOS, MEAN_EARTH_RADIUS, G
 try:
-    from fatiando.gravmag._tesseroid import *
+    from ._tesseroid import *
+    from . import _tesseroid
 except:
     def not_implemented(*args, **kwargs):
         raise NotImplementedError(
@@ -164,8 +165,33 @@ def potential(lons, lats, heights, tesseroids, dens=None, ratio=0.5):
     """
     Calculate the gravitational potential due to a tesseroid model.
     """
-    return _optimal_discretize(tesseroids, lons, lats, heights,
-                               _potential, ratio, dens)
+    if lons.shape != lats.shape or lons.shape != heights.shape:
+        raise ValueError("Arrays lons, lats and heights must have same length")
+    size = len(lons)
+    d2r = numpy.pi/180
+    sinlat = numpy.sin(d2r*lats)
+    coslat = numpy.cos(d2r*lats)
+    rlon = d2r*lons
+    radius = heights + MEAN_EARTH_RADIUS
+    res = numpy.zeros(size, dtype=numpy.float)
+    sinlatc = numpy.empty(2, dtype=numpy.float)
+    coslatc = numpy.empty(2, dtype=numpy.float)
+    lonc = numpy.empty(2, dtype=numpy.float)
+    rc = numpy.empty(2, dtype=numpy.float)
+    queue = numpy.empty((1000, 6), dtype=numpy.float)
+    for tess in tesseroids:
+        if tess is None or ('density' not in tess.props and dens is None):
+            continue
+        if dens is None:
+            density = tess.props['density']
+        else:
+            density = dens
+        w, e, s, n, top, bottom = tess.get_bounds()
+        _tesseroid.potential(rlon, sinlat, coslat, radius, w, e, s, n, top,
+                             bottom, density, ratio, size, res, sinlatc, coslatc, rc, lonc,
+                                        queue)
+    res *= G
+    return res
 
 
 def gx(lons, lats, heights, tesseroids, dens=None, ratio=1.):
