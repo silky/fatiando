@@ -126,9 +126,12 @@ finite-differencing of the wave equation, Geophysical Research Letters, 17(2),
 """
 from __future__ import division
 
+import sys
+from matplotlib import animation, pyplot as plt
 import numpy
 import scipy.sparse
 import scipy.sparse.linalg
+import h5py
 
 try:
     from fatiando.seismic._wavefd import *
@@ -144,6 +147,251 @@ except:
     _nonreflexive_psv_boundary_conditions = not_implemented
     _step_scalar = not_implemented
     _reflexive_scalar_boundary_conditions = not_implemented
+
+
+class Ricker(object):
+
+
+    def __init__(self, amp, cf, delay):
+        self.amp = amp
+        self.cf = cf
+        self.delay = delay
+
+
+    def __call__(self, time):
+        x = (numpy.pi*self.cf*(time - self.delay))**2
+        return self.amp*(1 - 2*x)*numpy.exp(-x)
+
+
+    def __mul__(self, scalar):
+        return Ricker(self.amp*scalar, self.cf, self.delay)
+
+
+    def __rmul__(self, scalar):
+        return self.__mul__(scalar)
+
+
+class SinSqr(Ricker):
+
+
+    def __init__(self, amp, cf, delay):
+        super(SinSqr, self).__init__(amp, cf, delay)
+
+
+    def __call__(self, time):
+        t = time - self.delay
+        return self.amp*numpy.sin(2*numpy.pi*self.cf*t)**2
+
+
+    def __mul__(self, scalar):
+        return SinSqr(self.amp*scalar, self.cf, self.delay)
+
+
+class ElasticPSV(object):
+    def __init__(self, pvel, svel, density, spacing, dt=None, padding=50,
+                 taper=0.007, cachefile='elasticpsv-cache.h5'):
+        self.pvel = pvel
+        self.svel = svel
+        self.density = density
+        self.mu = lame_mu(svel, density)
+        self.lamb = lame_lamb(pvel, svel, density)
+        self.spacing = spacing
+        self.shape = pvel.shape
+        nz, nx = self.shape
+        if dt is None:
+            self.dt = 0.6*maxdt([0, nx*spacing, 0, nz*spacing], self.shape,
+                                pvel.max())
+        else:
+            self.dt = dt
+        self.sources = []
+        self.padding = padding
+        self.taper = taper
+        self.stream = sys.stderr
+        self.cachefile = cachefile
+        self.it = 0
+
+
+    @staticmethod
+    def from_cache(fname):
+        with h5py.File(fname, 'r') as f:
+            sim = ElasticPSV(f['pvel'][:], f['svel'][:], f['density'][:],
+                             f['spacing'].value, dt=f['dt'].value,
+                             padding=f['padding'].value,
+                             taper=f['taper'].value, cachefile=fname)
+            sim.it = f['xpanels'].shape[0]
+        return sim
+
+
+    def add_blast_source(self, position, wavelet):
+        nz, nx = self.shape
+        i, j = position
+        tmp = numpy.sqrt(2)
+        locations = [[i - 1, j - 1, -1, -1],
+                     [i - 1, j, 0, -tmp],
+                     [i - 1,j + 1, 1, -1],
+                     [i, j - 1, -tmp, 0],
+                     [i, j + 1, tmp, 0],
+                     [i + 1, j - 1, -1, 1],
+                     [i + 1, j, 0, tmp],
+                     [i + 1, j + 1, 1, 1]]
+        for k, l, xamp, zamp in locations:
+            if k >= 0 and k < nz and l >= 0 and l < nx:
+                self.sources.append([[k, l], xamp*wavelet, zamp*wavelet])
+
+
+    def add_point_source(self, position, xwavelet, zwavelet):
+        self.sources.append([position, xwavelet, zwavelet])
+
+
+    def run(self, iterations):
+        nz, nx = self.shape
+        # Initialize the cache on the first run
+        if self.it == 0:
+            with h5py.File(self.cachefile, 'w') as f:
+                f.create_dataset('xpanels', tuple([2] + list(self.shape)),
+                                 maxshape=tuple([None] + list(self.shape)),
+                                 dtype=numpy.float)
+                f.create_dataset('zpanels', tuple([2] + list(self.shape)),
+                                 maxshape=tuple([None] + list(self.shape)),
+                                 dtype=numpy.float)
+                f.create_dataset('pvel', data=self.pvel)
+                f.create_dataset('svel', data=self.svel)
+                f.create_dataset('density', data=self.density)
+                f.create_dataset('spacing', data=self.spacing)
+                f.create_dataset('dt', data=self.dt)
+                f.create_dataset('padding', data=self.padding)
+                f.create_dataset('taper', data=self.taper)
+            self.it = 2
+            iterations -= 2
+        with h5py.File(self.cachefile, 'a') as f:
+            # Get the last two panels from the cache
+            xcache = f['xpanels']
+            xcache.resize(self.it + iterations, axis=0)
+            zcache = f['zpanels']
+            zcache.resize(self.it + iterations, axis=0)
+            ux = numpy.copy(xcache[self.it - 2 : self.it][::-1], order='C')
+            uz = numpy.copy(zcache[self.it - 2 : self.it][::-1], order='C')
+            # Pre-compute the matrices required for the free-surface BC
+            dzdx = 1
+            identity = scipy.sparse.identity(nx)
+            B = scipy.sparse.eye(nx, nx, k=1) - scipy.sparse.eye(nx, nx, k=-1)
+            gamma = scipy.sparse.spdiags(
+                self.lamb[0]/(self.lamb[0] + 2*self.mu[0]), [0], nx, nx)
+            Mx1 = identity - 0.0625*(dzdx**2)*B*gamma*B
+            Mx2 = identity + 0.0625*(dzdx**2)*B*gamma*B
+            Mx3 = 0.5*dzdx*B
+            Mz1 = identity - 0.0625*(dzdx**2)*gamma*B*B
+            Mz2 = identity + 0.0625*(dzdx**2)*gamma*B*B
+            Mz3 = 0.5*dzdx*gamma*B
+            # Initialize the sources if this is the first run
+            if self.it == 2:
+                for pos, xsrc, zsrc in self.sources:
+                    i, j = pos
+                    ux[1, i, j] += xsrc(self.dt)
+                    uz[1, i, j] += zsrc(self.dt)
+            # The size of the progress status bar
+            places = 50
+            self.stream.write(''.join(['|', '-'*places, '|', '  0%']))
+            self.stream.flush()
+            numpyrinted = 0
+            for iteration in xrange(iterations):
+                t, tm1 = iteration%2, (iteration + 1)%2
+                tp1 = tm1
+                _step_elastic_psv(ux, uz, tp1, t, tm1, 1, nx - 1,  1, nz - 1,
+                                  self.dt, self.spacing, self.spacing,
+                                  self.mu, self.lamb, self.density)
+                _apply_damping(ux[t], nx, nz, self.padding, self.taper)
+                _apply_damping(uz[t], nx, nz, self.padding, self.taper)
+                # Free-surface boundary conditions
+                ux[tp1,0,:] = scipy.sparse.linalg.spsolve(
+                    Mx1, Mx2*ux[tp1,1,:] + Mx3*uz[tp1,1,:])
+                uz[tp1,0,:] = scipy.sparse.linalg.spsolve(
+                    Mz1, Mz2*uz[tp1,1,:] + Mz3*ux[tp1,1,:])
+                _nonreflexive_psv_boundary_conditions(
+                    ux, uz, tp1, t, tm1, nx, nz, self.dt, self.spacing,
+                    self.spacing, self.mu, self.lamb, self.density)
+                _apply_damping(ux[tp1], nx, nz, self.padding, self.taper)
+                _apply_damping(uz[tp1], nx, nz, self.padding, self.taper)
+                for pos, xsrc, zsrc in self.sources:
+                    i, j = pos
+                    ux[tp1, i, j] += xsrc((self.it + iteration)*self.dt)
+                    uz[tp1, i, j] += zsrc((self.it + iteration)*self.dt)
+                # Store the panels in the cache
+                xcache[self.it + iteration] = ux[tp1]
+                zcache[self.it + iteration] = uz[tp1]
+                # Update the status bar
+                percent = int(round(100*(iteration + 1)/iterations))
+                n = int(round(0.01*percent*places))
+                if n > numpyrinted:
+                    self.stream.write(''.join(['\r|', '#'*n, '-'*(places - n),
+                                               '|', '%3d%s' % (percent, '%')]))
+                    self.stream.flush()
+                    numpyrinted = n
+            self.it += iterations
+            # Make sure the progress bar ends in 100 percent
+            self.stream.write(''.join(['\r|', '#'*places, '|', '100%']))
+            self.stream.flush()
+
+
+    def animate_wavefield(self, every=1, ranges=[-1e-5, 1e-5], ax=None,
+                          **kwargs):
+        with h5py.File(self.cachefile, 'r') as f:
+            xcache = f['xpanels']
+            zcache = f['zpanels']
+            p = numpy.empty(self.shape, dtype=numpy.float)
+            s = numpy.empty(self.shape, dtype=numpy.float)
+            nz, nx = self.shape
+            dx, dz = nx*self.spacing, nz*self.spacing
+            if ax is None:
+                plt.figure()
+                ax = plt.subplot(1, 1, 1)
+                plt.set_xlim(0, dx)
+                plt.set_ylim(0, dz)
+                ax.invert_yaxis()
+            wavefield = plt.imshow(numpy.zeros(self.shape), vmin=ranges[0],
+                                   vmax=ranges[1], cmap=plt.cm.seismic)
+            frames = (self.it - 1)//every
+            def plot(i, xcache=xcache, zcache=zcache):
+                ax.set_title(i*every)
+                ux = xcache[i*every]
+                uz = zcache[i*every]
+                _xz2ps(ux, uz, p, s, nx, nz, self.spacing, self.spacing)
+                wavefield.set_array(p + s)
+                return wavefield, xcache, zcache
+            anim = animation.FuncAnimation(ax.get_figure(), plot,
+                                           frames=frames, **kwargs)
+            plt.show()
+        return anim
+
+
+    def animate_particles(self, every=1, scale=1, downsample=1, style='.k',
+                          markersize=1, ax=None, **kwargs):
+        with h5py.File(self.cachefile, 'r') as f:
+            xcache = f['xpanels']
+            zcache = f['zpanels']
+            nz, nx = self.shape
+            dx, dz = nx*self.spacing, nz*self.spacing
+            x, z = [i[::downsample, ::downsample].ravel()
+                    for i in numpy.meshgrid(numpy.linspace(0, dx, nx),
+                                            numpy.linspace(0, dz, nz))]
+            if ax is None:
+                plt.figure()
+                ax = plt.subplot(1, 1, 1)
+                plt.set_xlim(0, dx)
+                plt.set_ylim(0, dz)
+                ax.invert_yaxis()
+            particles, = plt.plot(x, z, style, markersize=markersize)
+            frames = (self.it - 1)//every
+            def plot(i, xcache=xcache, zcache=zcache):
+                ax.set_title(i*every)
+                ux = xcache[i*every][::downsample, ::downsample].ravel()
+                uz = zcache[i*every][::downsample, ::downsample].ravel()
+                particles.set_data(x + scale*ux, z + scale*uz)
+                return particles, xcache, zcache
+            anim = animation.FuncAnimation(ax.get_figure(), plot,
+                                           frames=frames, **kwargs)
+            plt.show()
+        return anim
 
 
 class MexHatSource(object):
