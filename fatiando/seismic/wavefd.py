@@ -394,6 +394,208 @@ class ElasticPSV(object):
         return anim
 
 
+class ElasticSH(object):
+    def __init__(self, velocity, density, spacing, dt=None, padding=50, taper=0.007, cachefile='elasticsh-cache.hdf5'):
+        self.density = density
+        self.velocity = velocity
+        self.spacing = spacing
+        self.mu = lame_mu(velocity, density)
+        self.shape = self.mu.shape
+        nz, nx = self.shape
+        if dt is None:
+            self.dt = 0.6*maxdt([0, nx*spacing, 0, nz*spacing], self.shape, velocity.max())
+        else:
+            self.dt = dt
+        self.sources = []
+        self.padding = padding
+        self.taper = taper
+        self.stream = sys.stderr
+        self.cachefile = cachefile
+        self.it = 0
+
+    @staticmethod
+    def from_cache(fname):
+        with h5py.File(fname, 'r') as f:
+            sim = ElasticSH(f['velocity'][:], f['density'][:], f['spacing'].value,
+                            dt=f['dt'].value, padding=f['padding'].value,
+                            taper=f['taper'].value, cachefile=fname)
+            sim.it = f['panels'].shape[0]
+        return sim
+
+    def add_point_source(self, position, wavelet):
+        self.sources.append([position, wavelet])
+
+    def run(self, iterations):
+        nz, nx = self.shape
+        dz, dx = self.spacing, self.spacing
+        # Initialize the cache on the first run
+        if self.it == 0:
+            with h5py.File(self.cachefile, 'w') as f:
+                cache = f.create_dataset('panels', tuple([2] + list(self.shape)),
+                                         maxshape=tuple([None] + list(self.shape)),
+                                         dtype=numpy.float)
+                f.create_dataset('velocity', data=self.velocity)
+                f.create_dataset('density', data=self.density)
+                f.create_dataset('spacing', data=self.spacing)
+                f.create_dataset('dt', data=self.dt)
+                f.create_dataset('padding', data=self.padding)
+                f.create_dataset('taper', data=self.taper)
+            self.it = 2
+            iterations -= 2
+        with h5py.File(self.cachefile, 'a') as f:
+            # Get the last two panels from the cache
+            cache = f['panels']
+            cache.resize(self.it + iterations, axis=0)
+            u = cache[self.it - 2 : self.it][::-1]
+            if self.it == 2:
+                for pos, src in self.sources:
+                    i, j = pos
+                    u[1, i, j] += src(self.dt)
+            # The size of the progress status bar
+            places = 50
+            self.stream.write(''.join(['|', '-'*places, '|', '  0%']))
+            self.stream.flush()
+            nprinted = 0
+            for iteration in xrange(iterations):
+                t, tm1 = iteration%2, (iteration + 1)%2
+                tp1 = tm1
+                _step_elastic_sh(u[tp1], u[t], u[tm1], 3, nx - 3, 3, nz - 3, self.dt, dx, dz, self.mu, self.density)
+                _apply_damping(u[t], nx, nz, self.padding, self.taper)
+                _nonreflexive_sh_boundary_conditions(u[tp1], u[t], nx, nz, self.dt, dx, dz, self.mu, self.density)
+                _apply_damping(u[tp1], nx, nz, self.padding, self.taper)
+                for pos, src in self.sources:
+                    i, j = pos
+                    u[tp1, i, j] += src((self.it + iteration)*self.dt)
+                cache[self.it + iteration] = u[tp1]
+                # Update the status bar
+                percent = int(round(100*(iteration + 1)/iterations))
+                n = int(round(0.01*percent*places))
+                if n > nprinted:
+                    self.stream.write(''.join(['\r|', '#'*n, '-'*(places - n), '|', '%3d%s' % (percent, '%')]))
+                    self.stream.flush()
+                    nprinted = n
+            self.it += iterations
+            # Make sure the progress bar ends in 100 percent
+            self.stream.write(''.join(['\r|', '#'*places, '|', '100%']))
+            self.stream.flush()
+
+    def animate(self, every=1, ranges=[-1e-5, 1e-5], ax=None, **kwargs):
+        with h5py.File(self.cachefile, 'r') as f:
+            cache = f['panels']
+            if ax is None:
+                plt.figure()
+                ax = plt.subplot(1, 1, 1)
+            wavefield = plt.imshow(numpy.zeros(self.shape), vmin=ranges[0], vmax=ranges[1], cmap=plt.cm.seismic)
+            frames = (self.it - 1)//every
+            def plot(i, cache=cache):
+                ax.set_title(i*every)
+                u = cache[i*every]
+                wavefield.set_array(u)
+                return wavefield, cache
+            anim = animation.FuncAnimation(ax.get_figure(), plot, frames=frames, **kwargs)
+            plt.show()
+        return anim
+
+
+class Scalar2D(object):
+    def __init__(self, velocity, spacing, dt=None, padding=50, taper=0.007, cachefile='scalar2d-cache.hdf5'):
+        self.velocity = velocity
+        self.spacing = spacing
+        self.shape = velocity.shape
+        nz, nx = self.shape
+        if dt is None:
+            self.dt = 0.6*maxdt([0, nx*spacing, 0, nz*spacing], self.shape, velocity.max())
+        else:
+            self.dt = dt
+        self.sources = []
+        self.padding = padding
+        self.taper = taper
+        self.stream = sys.stderr
+        self.cachefile = cachefile
+        self.it = 0
+
+    @staticmethod
+    def from_cache(fname):
+        with h5py.File(fname, 'r') as f:
+            sim = Scalar2D(f['velocity'][:], f['spacing'].value,
+                            dt=f['dt'].value, padding=f['padding'].value,
+                            taper=f['taper'].value, cachefile=fname)
+            sim.it = f['panels'].shape[0]
+        return sim
+
+    def add_point_source(self, position, wavelet):
+        self.sources.append([position, wavelet])
+
+    def run(self, iterations):
+        nz, nx = self.shape
+        # Initialize the cache on the first run
+        if self.it == 0:
+            with h5py.File(self.cachefile, 'w') as f:
+                cache = f.create_dataset('panels', tuple([2] + list(self.shape)),
+                                         maxshape=tuple([None] + list(self.shape)),
+                                         dtype=numpy.float)
+                f.create_dataset('velocity', data=self.velocity)
+                f.create_dataset('spacing', data=self.spacing)
+                f.create_dataset('dt', data=self.dt)
+                f.create_dataset('padding', data=self.padding)
+                f.create_dataset('taper', data=self.taper)
+            self.it = 2
+            iterations -= 2
+        with h5py.File(self.cachefile, 'a') as f:
+            # Get the last two panels from the cache
+            cache = f['panels']
+            cache.resize(self.it + iterations, axis=0)
+            u = cache[self.it - 2 : self.it][::-1]
+            if self.it == 2:
+                for pos, src in self.sources:
+                    i, j = pos
+                    u[1, i, j] += src(self.dt)
+            # The size of the progress status bar
+            places = 50
+            self.stream.write(''.join(['|', '-'*places, '|', '  0%']))
+            self.stream.flush()
+            nprinted = 0
+            for iteration in xrange(iterations):
+                t, tm1 = iteration%2, (iteration + 1)%2
+                tp1 = tm1
+                _step_scalar(u[tp1], u[t], u[tm1], 2, nx - 2, 2, nz - 2, self.dt, self.spacing, self.velocity)
+                _apply_damping(u[t], nx, nz, self.padding, self.taper)
+                _reflexive_scalar_boundary_conditions(u[tp1], nx, nz)
+                _apply_damping(u[tp1], nx, nz, self.padding, self.taper)
+                for pos, src in self.sources:
+                    i, j = pos
+                    u[tp1, i, j] += src((self.it + iteration)*self.dt)
+                cache[self.it + iteration] = u[tp1]
+                # Update the status bar
+                percent = int(round(100*(iteration + 1)/iterations))
+                n = int(round(0.01*percent*places))
+                if n > nprinted:
+                    self.stream.write(''.join(['\r|', '#'*n, '-'*(places - n), '|', '%3d%s' % (percent, '%')]))
+                    self.stream.flush()
+                    nprinted = n
+            self.it += iterations
+            # Make sure the progress bar ends in 100 percent
+            self.stream.write(''.join(['\r|', '#'*places, '|', '100%']))
+            self.stream.flush()
+
+    def animate(self, every=1, ranges=[-1e-5, 1e-5], ax=None, **kwargs):
+        with h5py.File(self.cachefile, 'r') as f:
+            cache = f['panels']
+            if ax is None:
+                plt.figure()
+                ax = plt.subplot(1, 1, 1)
+            wavefield = plt.imshow(numpy.zeros(self.shape), vmin=ranges[0], vmax=ranges[1], cmap=plt.cm.seismic)
+            frames = (self.it - 1)//every
+            def plot(i, cache=cache):
+                ax.set_title(i*every)
+                u = cache[i*every]
+                wavefield.set_array(u)
+                return wavefield, cache
+            anim = animation.FuncAnimation(ax.get_figure(), plot, frames=frames, **kwargs)
+            plt.show()
+        return anim
+
+
 class MexHatSource(object):
 
     r"""
